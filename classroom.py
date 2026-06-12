@@ -107,10 +107,16 @@ def _start_tunnel(name, port, timeout=45):
     return url
 
 
+_LINK_NOTE = ("Open these from a normal browser (your laptop, phones). They will NOT "
+              "load from inside this Colab VM itself — Colab can't resolve fresh "
+              "trycloudflare.com names — so don't test them with requests in a cell.")
+
+
 def _announce(activity, student_url, teacher_url):
     text = (f"\n{'=' * 70}\n{activity}\n{'=' * 70}\n"
             f"  STUDENT LINK (share this):   {student_url}\n"
-            f"  TEACHER LINK (keep private): {teacher_url}\n{'=' * 70}\n")
+            f"  TEACHER LINK (keep private): {teacher_url}\n"
+            f"  note: {_LINK_NOTE}\n{'=' * 70}\n")
     try:
         from IPython.display import HTML, display
         display(HTML(
@@ -121,7 +127,8 @@ def _announce(activity, student_url, teacher_url):
             f"<a href='{student_url}' target='_blank' style='font-size:1.25em'>"
             f"{student_url}</a><br><br>"
             f"🔑 <b>Teacher link</b> (open this yourself, don't share):<br>"
-            f"<a href='{teacher_url}' target='_blank'>{teacher_url}</a></div>"))
+            f"<a href='{teacher_url}' target='_blank'>{teacher_url}</a><br><br>"
+            f"<span style='color:#67737f;font-size:.85em'>ℹ️ {_LINK_NOTE}</span></div>"))
     except Exception:
         print(text)
 
