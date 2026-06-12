@@ -16,6 +16,7 @@ subprocess on *your* runtime with a hard timeout. That is fine for a classroom o
 throwaway Colab VM; do not host it anywhere you care about.
 """
 
+import concurrent.futures
 import io
 import json
 import multiprocessing
@@ -445,32 +446,34 @@ def _sp500_tickers():
     return sorted(table["Symbol"].str.replace(".", "-", regex=False))
 
 
-def _load_market(universe, custom_tickers, replay_start, replay_end, warmup,
-                 practice_days=60):
+def _resolve_tickers(universe, custom_tickers):
     if universe.lower().startswith("dow"):
-        tickers = DOW30
-    elif universe.lower().startswith("custom"):
+        return DOW30
+    if universe.lower().startswith("custom"):
         tickers = [t.strip().upper() for t in custom_tickers.split(",") if t.strip()]
         if len(tickers) < 2:
             raise ValueError("give at least two tickers in custom_tickers")
-    else:
-        tickers = _sp500_tickers()
+        return tickers
+    return _sp500_tickers()
+
+
+def _load_window(tickers, start_ts, end_ts, warmup):
+    """Open->close returns for [start_ts, end_ts) plus ~warmup days of run-in.
+
+    Returns (rets, t0): rets includes the warmup run-in; t0 is the first row index
+    on/after start_ts (i.e. the first tradable day of the window).
+    """
     import yfinance as yf
-    pad = int((practice_days + 2 * warmup) * 1.6) + 30   # calendar-day padding
-    start = pd.Timestamp(replay_start) - pd.Timedelta(days=pad)
-    print(f"downloading {len(tickers)} tickers from {start.date()} to {replay_end}...")
-    raw = yf.download(tickers, start=str(start.date()), end=str(replay_end),
+    pad_start = start_ts - pd.Timedelta(days=int(warmup * 1.6) + 12)
+    print(f"downloading {len(tickers)} tickers, {pad_start.date()} -> {end_ts.date()}...")
+    raw = yf.download(tickers, start=str(pad_start.date()), end=str(end_ts.date()),
                       auto_adjust=True, progress=False)
     rets = (raw["Close"] / raw["Open"] - 1)
     rets = rets.dropna(axis=1, thresh=int(0.95 * len(rets))).fillna(0.0)
-    n_replay = int((rets.index >= pd.Timestamp(replay_start)).sum())
-    if n_replay < 5:
-        raise ValueError("replay window has fewer than 5 trading days")
-    comp_t0 = len(rets) - n_replay                        # first competition day
-    prac_t0 = max(warmup, comp_t0 - practice_days)        # first practice day
-    print(f"market ready: {rets.shape[1]} stocks, {n_replay} competition days, "
-          f"{comp_t0 - prac_t0} practice days, {prac_t0} warmup days")
-    return rets, comp_t0, prac_t0
+    t0 = int((rets.index < start_ts).sum())
+    if len(rets) - t0 < 5:
+        raise ValueError(f"window {start_ts.date()}..{end_ts.date()} has <5 trading days")
+    return rets, t0
 
 
 # ---------------------------------------------------------------------------
@@ -529,10 +532,11 @@ def _generate_code(prompt_text, api_key, model):
     return _strip_fences(out["choices"][0]["message"]["content"])
 
 
-def _replay_in_child(code, t0, t1, conn):
-    """Run one student strategy on returns[t0:t1] (market is fork-shared)."""
+def _replay_in_child(code, which, conn):
+    """Run one student strategy on the named window (market is fork-shared)."""
     try:
-        returns, fee = _MARKET
+        returns, t0, t1 = _MARKET[which]
+        fee = _MARKET["fee"]
         ns = {"np": np, "pd": pd, "numpy": np, "pandas": pd, "Strategy": Strategy,
               "run_competition": lambda *a, **k: None}
         exec(code, ns)
@@ -565,7 +569,7 @@ def _replay_in_child(code, t0, t1, conn):
         conn.close()
 
 
-_MARKET = None         # (returns_df, warmup_t, fee) — set before forking children
+_MARKET = None         # {"practice"/"competition": (rets, t0, t1), "fee": f} — set pre-fork
 
 
 def _sharpe(pnl):
@@ -771,6 +775,7 @@ function podium(r){
     s.name + "</b> &nbsp; ROI " + (s.roi*100).toFixed(2) + "%</div>").join('');
   const pod = document.getElementById('podium');
   pod.innerHTML = "<h2>🏁 Final standings</h2>" + rows +
+      "<div class='muted'>" + (r.window_note || '') + "</div>" +
       "<div class='muted'>everyone else: check your own phone for your private placement</div>";
   pod.style.display = 'block';
   document.getElementById('full').innerHTML = '<pre>' + r.full_table + '</pre>';
@@ -779,18 +784,58 @@ poll(); setInterval(poll, 2000);
 """
 
 
-def launch_arena(universe="S&P 500", custom_tickers="", replay_start="2026-01-02",
-                 replay_end="2026-06-10", warmup=20, fee=0.0005,
+def launch_arena(universe="S&P 500", custom_tickers="",
+                 random_years=True, year_min=2016, year_max=None,
+                 replay_start="2026-01-02", replay_end="2026-06-10",
+                 warmup=20, fee=0.0005,
                  teacher_key=None, port=8771, tunnel=True, strategy_timeout=60,
                  openai_api_key="", llm_model="gpt-5-mini", practice_days=60):
-    """Host the Strategy Arena. Returns (student_url, teacher_url)."""
+    """Host the Strategy Arena. Returns (student_url, teacher_url).
+
+    Default mode (random_years=True): students test-drive on one random calendar
+    year >= year_min, and the competition replays a *different* random year — so
+    nobody can overfit the scoring window. Manual mode (random_years=False) uses
+    [replay_start, replay_end] for the competition and the practice_days before it.
+    """
     global _MARKET
     teacher_key = teacher_key or secrets.token_hex(4)
-    returns, comp_t0, prac_t0 = _load_market(universe, custom_tickers, replay_start,
-                                             replay_end, warmup, practice_days)
-    _MARKET = (returns, fee)
-    replay_dates = [d.strftime("%Y-%m-%d") for d in returns.index[comp_t0:]]
-    practice_dates = [d.strftime("%Y-%m-%d") for d in returns.index[prac_t0:comp_t0]]
+    tickers = _resolve_tickers(universe, custom_tickers)
+    if random_years:
+        year_max = year_max or pd.Timestamp.now().year - 1
+        years = list(range(year_min, year_max + 1))
+        prac_year = years[secrets.randbelow(len(years))]
+        comp_year = prac_year
+        while comp_year == prac_year and len(years) > 1:
+            comp_year = years[secrets.randbelow(len(years))]
+        print(f"🎲 practice year: {prac_year} | competition year: {comp_year}")
+        prac_rets, p0 = _load_window(tickers, pd.Timestamp(f"{prac_year}-01-01"),
+                                     pd.Timestamp(f"{prac_year + 1}-01-01"), warmup)
+        comp_rets, c0 = _load_window(tickers, pd.Timestamp(f"{comp_year}-01-01"),
+                                     pd.Timestamp(f"{comp_year + 1}-01-01"), warmup)
+        _MARKET = {"fee": fee,
+                   "practice": (prac_rets, p0, len(prac_rets)),
+                   "competition": (comp_rets, c0, len(comp_rets))}
+        window_note = (f"practice window: {prac_year} · "
+                       f"competition window: {comp_year}")
+    else:
+        end_ts = pd.Timestamp(replay_end)
+        start_ts = pd.Timestamp(replay_start)
+        prac_start = start_ts - pd.Timedelta(days=int(practice_days * 1.6) + 12)
+        full, p0 = _load_window(tickers, prac_start, end_ts, warmup)
+        c0 = int((full.index < start_ts).sum())
+        if len(full) - c0 < 5:
+            raise ValueError("replay window has fewer than 5 trading days")
+        _MARKET = {"fee": fee,
+                   "practice": (full, p0, c0),
+                   "competition": (full, c0, len(full))}
+        window_note = f"competition window: {replay_start} -> {replay_end}"
+    comp_rets_, comp_t0_, _ = _MARKET["competition"]
+    prac_rets_, prac_t0_, prac_t1_ = _MARKET["practice"]
+    replay_dates = [d.strftime("%Y-%m-%d") for d in comp_rets_.index[comp_t0_:]]
+    practice_dates = [d.strftime("%Y-%m-%d")
+                      for d in prac_rets_.index[prac_t0_:prac_t1_]]
+    print(f"arena ready: {comp_rets_.shape[1]} stocks | "
+          f"{len(practice_dates)} practice days, {len(replay_dates)} competition days")
 
     state = {"phase": "open", "players": {}, "results": None}
     lock = threading.Lock()
@@ -799,10 +844,10 @@ def launch_arena(universe="S&P 500", custom_tickers="", replay_start="2026-01-02
     def _finite(x, fallback=0.0):
         return float(x) if np.isfinite(x) else fallback
 
-    def _replay(code, t0, t1):
+    def _replay(code, which):
         ctx = multiprocessing.get_context("fork")
         parent, child = ctx.Pipe()
-        proc = ctx.Process(target=_replay_in_child, args=(code, t0, t1, child))
+        proc = ctx.Process(target=_replay_in_child, args=(code, which, child))
         proc.start()
         child.close()
         out = {"error": f"timed out ({strategy_timeout}s limit)"}
@@ -815,7 +860,7 @@ def launch_arena(universe="S&P 500", custom_tickers="", replay_start="2026-01-02
 
     def _test_drive(token_, name, code_text):
         """Replay on the practice window only; the competition window stays unseen."""
-        out = _replay(code_text, prac_t0, comp_t0)
+        out = _replay(code_text, "practice")
         if "error" in out:
             return {"token": token_, "name": name, "code": code_text,
                     "run_error": out["error"]}
@@ -863,10 +908,13 @@ def launch_arena(universe="S&P 500", custom_tickers="", replay_start="2026-01-02
             entries = [(tok, p["name"], p["entry_code"])
                        for tok, p in state["players"].items() if p["entry_code"]]
         results = {}
-        for tok, name, code_text in entries:
-            out = _replay(code_text, comp_t0, len(returns))
-            results[tok] = {"name": name, **out}
-        R = returns.to_numpy()[comp_t0:]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_replay, code_text, "competition"): (tok, name)
+                       for tok, name, code_text in entries}
+            for fut in concurrent.futures.as_completed(futures):
+                tok, name = futures[fut]
+                results[tok] = {"name": name, **fut.result()}
+        R = comp_rets_.to_numpy()[comp_t0_:]
         results["__baseline__"] = {"name": "1/N baseline",
                                    "pnl": R.mean(axis=1).tolist()}
         n_days = len(replay_dates)
@@ -1004,6 +1052,7 @@ def launch_arena(universe="S&P 500", custom_tickers="", replay_start="2026-01-02
             if "error" in r and t != "__baseline__":
                 lines.append(f"  💥  {r['name']:<26} {r['error']}")
         return jsonify({"dates": replay_dates, "series": series, "top3": top3,
+                        "window_note": window_note,
                         "full_table": "\n".join(lines)})
 
     @app.get("/me/<token>")
