@@ -17,6 +17,7 @@ throwaway Colab VM; do not host it anywhere you care about.
 """
 
 import io
+import json
 import multiprocessing
 import os
 import re
@@ -25,6 +26,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import numpy as np
@@ -443,7 +445,8 @@ def _sp500_tickers():
     return sorted(table["Symbol"].str.replace(".", "-", regex=False))
 
 
-def _load_market(universe, custom_tickers, replay_start, replay_end, warmup):
+def _load_market(universe, custom_tickers, replay_start, replay_end, warmup,
+                 practice_days=60):
     if universe.lower().startswith("dow"):
         tickers = DOW30
     elif universe.lower().startswith("custom"):
@@ -453,7 +456,8 @@ def _load_market(universe, custom_tickers, replay_start, replay_end, warmup):
     else:
         tickers = _sp500_tickers()
     import yfinance as yf
-    start = pd.Timestamp(replay_start) - pd.Timedelta(days=2 * warmup + 40)
+    pad = int((practice_days + 2 * warmup) * 1.6) + 30   # calendar-day padding
+    start = pd.Timestamp(replay_start) - pd.Timedelta(days=pad)
     print(f"downloading {len(tickers)} tickers from {start.date()} to {replay_end}...")
     raw = yf.download(tickers, start=str(start.date()), end=str(replay_end),
                       auto_adjust=True, progress=False)
@@ -462,15 +466,73 @@ def _load_market(universe, custom_tickers, replay_start, replay_end, warmup):
     n_replay = int((rets.index >= pd.Timestamp(replay_start)).sum())
     if n_replay < 5:
         raise ValueError("replay window has fewer than 5 trading days")
-    print(f"market ready: {rets.shape[1]} stocks, {n_replay} replay days "
-          f"(+{len(rets) - n_replay} warmup days)")
-    return rets, len(rets) - n_replay
+    comp_t0 = len(rets) - n_replay                        # first competition day
+    prac_t0 = max(warmup, comp_t0 - practice_days)        # first practice day
+    print(f"market ready: {rets.shape[1]} stocks, {n_replay} competition days, "
+          f"{comp_t0 - prac_t0} practice days, {prac_t0} warmup days")
+    return rets, comp_t0, prac_t0
 
 
-def _replay_in_child(code, conn):
-    """Run one student strategy against the module-global market (fork-shared)."""
+# ---------------------------------------------------------------------------
+# LLM code generation (OpenAI chat completions, no SDK needed)
+# ---------------------------------------------------------------------------
+
+CODEGEN_SYSTEM = """You write trading strategies for a classroom competition.
+
+The environment defines this base class:
+
+    class Strategy:
+        name = "unnamed strategy"
+        def allocate(self, past_returns):
+            ...
+
+allocate() is called once per simulated trading day. `past_returns` is a pandas
+DataFrame (rows = past trading days in chronological order, columns = stock tickers)
+holding each stock's daily open-to-close return for every day BEFORE today. It must
+return a pandas Series mapping tickers to weights: positive = long, negative = short.
+If the absolute weights sum to more than 1 they get rescaled to 1 (the player bets $1
+per day total); unallocated money sits in cash. A fee of 0.05% is charged on every
+dollar of position changed between days, and the winner has the highest ROI.
+
+Hard rules for the code you write:
+- Use ONLY the `past_returns` argument plus numpy (as np) and pandas (as pd) — no
+  other imports, no network, no files, no randomness.
+- Keep allocate() fast: a few vectorized pandas operations.
+- Set a short `name` class attribute.
+
+Implement the user's strategy idea as a single Strategy subclass. Reply with ONLY the
+Python code — no backticks, no explanations, no example usage."""
+
+
+def _strip_fences(text):
+    text = text.strip()
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.S)
+    return m.group(1).strip() if m else text
+
+
+def _generate_code(prompt_text, api_key, model):
+    """One OpenAI chat-completions call; returns generated code or raises."""
+    body = json.dumps({"model": model, "messages": [
+        {"role": "system", "content": CODEGEN_SYSTEM},
+        {"role": "user", "content": f"My strategy idea: {prompt_text}"},
+    ]}).encode()
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions", data=body,
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"})
     try:
-        returns, warmup_t, fee = _MARKET
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            out = json.load(resp)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        raise RuntimeError(f"LLM call failed (HTTP {e.code}): {detail}") from e
+    return _strip_fences(out["choices"][0]["message"]["content"])
+
+
+def _replay_in_child(code, t0, t1, conn):
+    """Run one student strategy on returns[t0:t1] (market is fork-shared)."""
+    try:
+        returns, fee = _MARKET
         ns = {"np": np, "pd": pd, "numpy": np, "pandas": pd, "Strategy": Strategy,
               "run_competition": lambda *a, **k: None}
         exec(code, ns)
@@ -487,7 +549,7 @@ def _replay_in_child(code, conn):
         R = returns.to_numpy()
         w_prev = pd.Series(0.0, index=returns.columns)
         pnl = []
-        for t in range(warmup_t, len(returns)):
+        for t in range(t0, t1):
             w = pd.Series(strat.allocate(returns.iloc[:t]), dtype=float)
             w = w.reindex(returns.columns).fillna(0.0)
             gross = float(w.abs().sum())
@@ -517,16 +579,26 @@ _ARENA_STUDENT = """
 <div class='card'>
   <h1>🏆 The Strategy Arena</h1>
   <div id='openview'>
-    <p>Paste the <b>Strategy subclass</b> from your competition cell (Part 6 of the
-    lab). One entry per team — resubmitting replaces your old entry.</p>
     <input id='name' placeholder='your name / team name' maxlength='24'>
-    <br><br>
-    <textarea id='code' rows='14' placeholder='class MyStrategy(Strategy):
-    name = "my strategy"
-    def allocate(self, past_returns):
-        ...'></textarea>
-    <button onclick='submitCode()'>🚀 Enter the arena</button>
+    <div id='llmbox'>
+      <p><b>Describe your trading strategy</b> in plain English. An LLM turns it into
+      code and test-drives it on a <i>practice window</i> — the real competition runs
+      on dates you haven't seen scored yet.</p>
+      <textarea id='prompt' rows='4' placeholder="e.g. Buy the 5 stocks that fell the most last week — they usually bounce back. Put a little extra weight on the biggest loser."></textarea>
+      <button id='genbtn' onclick='generate()'>✨ Generate &amp; test-drive</button>
+    </div>
+    <details style='margin-top:8px'><summary class='muted'>…or paste Strategy code directly</summary>
+      <textarea id='code' rows='10' placeholder='class MyStrategy(Strategy): ...'></textarea>
+      <button onclick='tryout()'>🧪 Test-drive my code</button>
+    </details>
     <div id='msg'></div>
+    <div id='preview' style='display:none'>
+      <h2>Practice run <span id='pstats' class='muted'></span></h2>
+      <canvas id='pchart' height='160'></canvas>
+      <details><summary class='muted'>the generated code</summary><pre id='pcode' style='font-size:.75em;overflow-x:auto'></pre></details>
+      <button id='subbtn' onclick='submitEntry()'>🚀 Submit this strategy to the competition</button>
+      <div id='submsg'></div>
+    </div>
   </div>
   <div id='waitview' style='display:none'>
     <h2>🔒 Submissions are locked.</h2>
@@ -541,23 +613,66 @@ _ARENA_STUDENT = """
 """
 
 _ARENA_STUDENT_JS = """
+let chart = null, busy = false;
 function token(){ return localStorage.getItem('arena_token') || ''; }
-async function submitCode(){
+function msg(id, html){ document.getElementById(id).innerHTML = html; }
+async function callTest(endpoint, payload){
+  if(busy) return; busy = true;
   const name = document.getElementById('name').value.trim();
-  const code = document.getElementById('code').value;
-  const msg = document.getElementById('msg');
-  if(!name || !code.trim()){ msg.innerHTML = "<span class='bad'>need a name and some code</span>"; return; }
+  if(!name){ msg('msg', "<span class='bad'>enter a name first</span>"); busy = false; return; }
+  msg('msg', "⏳ working — generating and replaying your strategy (10–30 s)…");
+  document.getElementById('genbtn').disabled = true;
+  try{
+    const res = await fetch(endpoint, {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(Object.assign({name:name, token: token()}, payload))});
+    const j = await res.json();
+    if(!res.ok){ msg('msg', "<span class='bad'>" + (j.error||'error') + "</span>"); return; }
+    localStorage.setItem('arena_token', j.token);
+    if(j.run_error){
+      msg('msg', "<span class='bad'>💥 the strategy crashed in testing: " + j.run_error + "</span>");
+      document.getElementById('pcode').textContent = j.code || '';
+      return;
+    }
+    msg('msg', "<span class='ok'>✔ test-drive complete</span>");
+    showPreview(j);
+  } finally { busy = false; document.getElementById('genbtn').disabled = false; }
+}
+function generate(){
+  const p = document.getElementById('prompt').value.trim();
+  if(!p){ msg('msg', "<span class='bad'>describe a strategy first</span>"); return; }
+  callTest('generate', {prompt: p});
+}
+function tryout(){
+  const c = document.getElementById('code').value;
+  if(!c.trim()){ msg('msg', "<span class='bad'>paste some code first</span>"); return; }
+  callTest('tryout', {code: c});
+}
+function showPreview(j){
+  document.getElementById('preview').style.display = 'block';
+  document.getElementById('pcode').textContent = j.code;
+  document.getElementById('pstats').textContent =
+    '— ROI ' + (100*j.preview.roi).toFixed(2) + '% · Sharpe ' + j.preview.sharpe.toFixed(2);
+  msg('submsg', '');
+  if(chart) chart.destroy();
+  chart = new Chart(document.getElementById('pchart'), {type:'line',
+    data:{labels:j.preview.dates, datasets:[{label:'your strategy (practice window)',
+      data:j.preview.cum, borderColor:'#4a6fa5', borderWidth:2, pointRadius:0}]},
+    options:{plugins:{legend:{display:true}},
+      scales:{x:{ticks:{maxTicksLimit:8}}, y:{title:{display:true,text:'profit ($1/day)'}}}}});
+}
+async function submitEntry(){
   const res = await fetch('submit', {method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({name:name, code:code, token: token()})});
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({token: token()})});
   const j = await res.json();
-  if(res.ok){ localStorage.setItem('arena_token', j.token);
-    msg.innerHTML = "<span class='ok'>✔ entered as <b>" + j.name + "</b> — you can resubmit until the teacher locks it</span>";
-  } else { msg.innerHTML = "<span class='bad'>" + (j.error || 'error') + "</span>"; }
+  if(res.ok) msg('submsg', "<span class='ok'>✔ in the competition as <b>" + j.name +
+    "</b> — generate again and resubmit any time before lock</span>");
+  else msg('submsg', "<span class='bad'>" + (j.error||'error') + "</span>");
 }
 async function poll(){
   const s = await fetch('state').then(r=>r.json()).catch(()=>null);
   if(!s) return;
+  if(!s.llm_enabled) document.getElementById('llmbox').style.display = 'none';
   const show = id => { for(const v of ['openview','waitview','doneview'])
       document.getElementById(v).style.display = (v===id) ? 'block':'none'; };
   if(s.phase === 'open') show('openview');
@@ -666,46 +781,101 @@ poll(); setInterval(poll, 2000);
 
 def launch_arena(universe="S&P 500", custom_tickers="", replay_start="2026-01-02",
                  replay_end="2026-06-10", warmup=20, fee=0.0005,
-                 teacher_key=None, port=8771, tunnel=True, strategy_timeout=60):
+                 teacher_key=None, port=8771, tunnel=True, strategy_timeout=60,
+                 openai_api_key="", llm_model="gpt-5-mini", practice_days=60):
     """Host the Strategy Arena. Returns (student_url, teacher_url)."""
     global _MARKET
     teacher_key = teacher_key or secrets.token_hex(4)
-    returns, warmup_t = _load_market(universe, custom_tickers,
-                                     replay_start, replay_end, warmup)
-    _MARKET = (returns, warmup_t, fee)
-    replay_dates = [d.strftime("%Y-%m-%d") for d in returns.index[warmup_t:]]
+    returns, comp_t0, prac_t0 = _load_market(universe, custom_tickers, replay_start,
+                                             replay_end, warmup, practice_days)
+    _MARKET = (returns, fee)
+    replay_dates = [d.strftime("%Y-%m-%d") for d in returns.index[comp_t0:]]
+    practice_dates = [d.strftime("%Y-%m-%d") for d in returns.index[prac_t0:comp_t0]]
 
-    state = {"phase": "open", "subs": {}, "results": None}
+    state = {"phase": "open", "players": {}, "results": None}
     lock = threading.Lock()
     app = Flask("arena")
 
+    def _finite(x, fallback=0.0):
+        return float(x) if np.isfinite(x) else fallback
+
+    def _replay(code, t0, t1):
+        ctx = multiprocessing.get_context("fork")
+        parent, child = ctx.Pipe()
+        proc = ctx.Process(target=_replay_in_child, args=(code, t0, t1, child))
+        proc.start()
+        child.close()
+        out = {"error": f"timed out ({strategy_timeout}s limit)"}
+        if parent.poll(strategy_timeout):
+            out = parent.recv()
+        proc.join(1)
+        if proc.is_alive():
+            proc.terminate()
+        return out
+
+    def _test_drive(token_, name, code_text):
+        """Replay on the practice window only; the competition window stays unseen."""
+        out = _replay(code_text, prac_t0, comp_t0)
+        if "error" in out:
+            return {"token": token_, "name": name, "code": code_text,
+                    "run_error": out["error"]}
+        pnl = np.asarray(out["pnl"], dtype=float)
+        return {"token": token_, "name": name, "code": code_text, "preview": {
+            "dates": practice_dates,
+            "cum": np.cumsum(pnl).round(5).tolist(),
+            "roi": _finite(pnl.sum() / max(len(pnl), 1)),
+            "sharpe": _finite(_sharpe(pnl)),
+        }}
+
+    def _register(body):
+        """Resolve (token, player), creating and de-duplicating names. Lock held."""
+        token_ = str(body.get("token") or "")
+        name = str(body.get("name", "")).strip()[:24]
+        if token_ not in state["players"]:
+            token_ = secrets.token_hex(8)
+            state["players"][token_] = {"name": name or "anon", "code": None,
+                                        "entry_code": None, "last_try": 0.0}
+        player = state["players"][token_]
+        if name and name != player["name"]:
+            taken = {p["name"] for t, p in state["players"].items() if t != token_}
+            base, k = name, 2
+            while name in taken:
+                name = f"{base} ({k})"
+                k += 1
+            player["name"] = name
+        return token_, player
+
+    def _gate(body, cooldown):
+        """Common open-phase + rate-limit gate. Returns (error, token, name)."""
+        with lock:
+            if state["phase"] != "open":
+                return ({"error": "submissions are locked"}, 409), None, None
+            token_, player = _register(body)
+            now = time.time()
+            if now - player["last_try"] < cooldown:
+                return ({"error": "easy there — wait a few seconds and try again"},
+                        429), None, None
+            player["last_try"] = now
+            return None, token_, player["name"]
+
     def _run_all():
         with lock:
-            entries = [(tok, s["name"], s["code"]) for tok, s in state["subs"].items()]
+            entries = [(tok, p["name"], p["entry_code"])
+                       for tok, p in state["players"].items() if p["entry_code"]]
         results = {}
-        ctx = multiprocessing.get_context("fork")
-        for tok, name, code in entries:
-            parent, child = ctx.Pipe()
-            proc = ctx.Process(target=_replay_in_child, args=(code, child))
-            proc.start()
-            child.close()
-            out = {"error": f"timed out ({strategy_timeout}s limit)"}
-            if parent.poll(strategy_timeout):
-                out = parent.recv()
-            proc.join(1)
-            if proc.is_alive():
-                proc.terminate()
+        for tok, name, code_text in entries:
+            out = _replay(code_text, comp_t0, len(returns))
             results[tok] = {"name": name, **out}
-        # baseline: 1/N across the whole field
-        R = returns.to_numpy()[warmup_t:]
-        results["__baseline__"] = {"name": "1/N baseline", "pnl": R.mean(axis=1).tolist()}
+        R = returns.to_numpy()[comp_t0:]
+        results["__baseline__"] = {"name": "1/N baseline",
+                                   "pnl": R.mean(axis=1).tolist()}
         n_days = len(replay_dates)
         ranked = []
         for tok, r in results.items():
             if "pnl" in r:
-                pnl = np.asarray(r["pnl"])
-                r["roi"] = float(pnl.sum() / n_days)
-                r["sharpe"] = _sharpe(pnl)
+                pnl = np.asarray(r["pnl"], dtype=float)
+                r["roi"] = _finite(pnl.sum() / n_days)
+                r["sharpe"] = _finite(_sharpe(pnl))
                 r["cum"] = np.cumsum(pnl).round(5).tolist()
                 if tok != "__baseline__":
                     ranked.append(tok)
@@ -731,31 +901,63 @@ def launch_arena(universe="S&P 500", custom_tickers="", replay_start="2026-01-02
     @app.get("/state")
     def get_state():
         with lock:
-            return jsonify({"phase": state["phase"], "n_subs": len(state["subs"]),
-                            "names": [s["name"] for s in state["subs"].values()]})
+            entered = [p["name"] for p in state["players"].values() if p["entry_code"]]
+            return jsonify({"phase": state["phase"], "n_subs": len(entered),
+                            "names": entered, "llm_enabled": bool(openai_api_key)})
+
+    @app.post("/generate")
+    def generate():
+        if not openai_api_key:
+            return jsonify({"error": "AI generation is not enabled — paste code instead"}), 400
+        body = request.get_json(force=True)
+        prompt_text = str(body.get("prompt", "")).strip()
+        if not prompt_text or len(prompt_text) > 2000:
+            return jsonify({"error": "describe a strategy (under 2000 characters)"}), 400
+        if not str(body.get("name", "")).strip():
+            return jsonify({"error": "enter a name first"}), 400
+        gate_err, token_, name = _gate(body, cooldown=8)
+        if gate_err:
+            payload, status = gate_err
+            return jsonify(payload), status
+        try:
+            code_text = _generate_code(prompt_text, openai_api_key, llm_model)
+        except Exception as e:                               # noqa: BLE001
+            return jsonify({"error": str(e)}), 502
+        result = _test_drive(token_, name, code_text)
+        with lock:
+            state["players"][token_]["code"] = code_text
+        return jsonify(result)
+
+    @app.post("/tryout")
+    def tryout():
+        body = request.get_json(force=True)
+        code_text = str(body.get("code", ""))
+        if not code_text.strip() or len(code_text) > 20000:
+            return jsonify({"error": "paste some code (under 20k characters)"}), 400
+        if not str(body.get("name", "")).strip():
+            return jsonify({"error": "enter a name first"}), 400
+        gate_err, token_, name = _gate(body, cooldown=3)
+        if gate_err:
+            payload, status = gate_err
+            return jsonify(payload), status
+        result = _test_drive(token_, name, code_text)
+        with lock:
+            state["players"][token_]["code"] = code_text
+        return jsonify(result)
 
     @app.post("/submit")
     def submit():
         body = request.get_json(force=True)
-        name = str(body.get("name", "")).strip()[:24]
-        code_text = str(body.get("code", ""))
-        if not name or not code_text.strip():
-            return jsonify({"error": "need a name and some code"}), 400
-        if len(code_text) > 20000:
-            return jsonify({"error": "code too long"}), 400
+        token_ = str(body.get("token") or "")
         with lock:
             if state["phase"] != "open":
                 return jsonify({"error": "submissions are locked"}), 409
-            token = str(body.get("token") or "")
-            if token not in state["subs"]:
-                token = secrets.token_hex(8)
-            taken = {s["name"] for t, s in state["subs"].items() if t != token}
-            base_name, k = name, 2
-            while name in taken:
-                name = f"{base_name} ({k})"
-                k += 1
-            state["subs"][token] = {"name": name, "code": code_text}
-        return jsonify({"token": token, "name": name})
+            player = state["players"].get(token_)
+            if player is None or not player["code"]:
+                return jsonify({"error": "test-drive a strategy first"}), 400
+            player["entry_code"] = player["code"]
+            name = player["name"]
+        return jsonify({"token": token_, "name": name})
 
     @app.post("/action")
     def action():
@@ -820,3 +1022,230 @@ def launch_arena(universe="S&P 500", custom_tickers="", replay_start="2026-01-02
     teacher_url = f"{base}/teacher?key={teacher_key}"
     _announce("🏆 Activity 2 — The Strategy Arena", student_url, teacher_url)
     return student_url, teacher_url
+
+
+# ============================================================================
+# ACTIVITY 3 — the lecture dashboard
+# ============================================================================
+
+def _dashboard_compute(tickers, start, cutoff):
+    """Download data and precompute every panel's series (JSON-safe floats)."""
+    import warnings as _warnings
+    import yfinance as yf
+    from statsmodels.tsa.arima.model import ARIMA
+    names = [t.strip().upper() for t in str(tickers).split(",") if t.strip()]
+    if not names:
+        raise ValueError("give at least one ticker")
+    print(f"dashboard: downloading {names} from {start}...")
+    raw = yf.download(names, start=str(start), auto_adjust=True, progress=False)
+    opens, closes = raw["Open"].dropna(), raw["Close"].dropna()
+    opens, closes = opens.align(closes, join="inner", axis=0)
+    if len(closes) < 80:
+        raise ValueError("fewer than 80 shared trading days — check the tickers")
+
+    dates = [d.strftime("%Y-%m-%d") for d in closes.index]
+    growth = {t: (closes[t] / closes[t].iloc[0]).round(4).tolist()
+              for t in closes.columns}
+    day_ret = closes / opens - 1
+    daycum = {t: day_ret[t].cumsum().round(4).tolist() for t in day_ret.columns}
+
+    R = day_ret.to_numpy()
+    n = len(R)
+    ftl = np.zeros(n)
+    if R.shape[1] > 1:
+        ftl[1:] = R[np.arange(1, n), R[:-1].argmax(axis=1)]
+    arena = {
+        "1/N uniform": np.cumsum(R.mean(axis=1)).round(4).tolist(),
+        "FTL (yesterday's best)": np.cumsum(ftl).round(4).tolist(),
+        "oracle (sees today)": np.cumsum(R.max(axis=1)).round(4).tolist(),
+    }
+
+    cutoff_ts = pd.Timestamp(cutoff)
+    forecast = {}
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        for t in closes.columns:
+            price = closes[t]
+            train = price[price.index <= cutoff_ts]
+            test = price[price.index > cutoff_ts]
+            if len(train) < 100 or len(test) < 5:
+                continue
+            res = ARIMA(train.to_numpy(), order=(1, 1, 1)).fit()
+            fc = res.get_forecast(len(test))
+            mean = np.asarray(fc.predicted_mean)
+            ci = np.asarray(fc.conf_int())
+            tail = int(min(250, len(train)))
+            forecast[t] = {
+                "labels": ([d.strftime("%Y-%m-%d") for d in train.index[-tail:]]
+                           + [d.strftime("%Y-%m-%d") for d in test.index]),
+                "n_train": tail,
+                "train": train.iloc[-tail:].round(2).tolist(),
+                "actual": test.round(2).tolist(),
+                "mean": mean.round(2).tolist(),
+                "lo": ci[:, 0].round(2).tolist(),
+                "hi": ci[:, 1].round(2).tolist(),
+            }
+    print("dashboard data ready")
+    return {"tickers": ", ".join(closes.columns), "start": str(start),
+            "cutoff": str(cutoff), "dates": dates, "growth": growth,
+            "daycum": daycum, "arena": arena, "forecast": forecast}
+
+
+_DASH_HTML = """
+<div class='card'>
+  <h1>📊 Lecture Dashboard</h1>
+  <div id='controls'>
+    <input id='tickers' style='max-width:360px;display:inline-block'
+           placeholder='^GSPC, BTC-USD, GME'>
+    <input id='cutoff' type='date' style='max-width:180px;display:inline-block'>
+    <button id='apply' onclick='applySettings()'>Apply &amp; rebuild</button>
+    <span id='cmsg' class='muted'></span>
+  </div>
+</div>
+<div class='card'><h2>1 — Growth of $1, buy &amp; hold <span class='muted'>(log scale)</span></h2>
+  <button onclick="play('growth')">▶ Play</button>
+  <button onclick="finish('growth')" style='background:#67737f'>⏭ End</button>
+  <canvas id='growth' height='110'></canvas></div>
+<div class='card'><h2>2 — $1 every day: in at the open, out at the close</h2>
+  <button onclick="play('daycum')">▶ Play</button>
+  <button onclick="finish('daycum')" style='background:#67737f'>⏭ End</button>
+  <canvas id='daycum' height='110'></canvas></div>
+<div class='card'><h2>3 — Online learning: uniform vs. FTL vs. the oracle</h2>
+  <button onclick="play('arena')">▶ Play</button>
+  <button onclick="finish('arena')" style='background:#67737f'>⏭ End</button>
+  <canvas id='arena' height='110'></canvas></div>
+<div class='card'><h2>4 — Forecasting past the cutoff (ARIMA)</h2>
+  <select id='fticker' onchange='buildForecast()'
+          style='padding:8px;border-radius:8px;background:#1a212c;color:#e8edf3'></select>
+  <button onclick="play('forecast')">▶ Play</button>
+  <button onclick="finish('forecast')" style='background:#67737f'>⏭ End</button>
+  <canvas id='forecast' height='110'></canvas></div>
+"""
+
+_DASH_JS = """
+const KEY = new URLSearchParams(location.search).get('key') || '';
+const PALETTE = ['#7ba3d6','#e8a87c','#85cdca','#e27d60','#c38d9e','#a8d672',
+                 '#f4d35e','#9fa8da','#80cbc4','#ef9a9a'];
+let charts = {}, fulls = {}, timers = {}, DATA = null;
+function mk(id, labels, datasets, yextra){
+  if(charts[id]) charts[id].destroy();
+  fulls[id] = {labels: labels, data: datasets.map(d => d.data)};
+  const sets = datasets.map(d => Object.assign({}, d, {data: []}));
+  charts[id] = new Chart(document.getElementById(id), {type:'line',
+    data:{labels:[], datasets:sets},
+    options:{animation:false, spanGaps:false,
+      plugins:{legend:{labels:{color:'#e8edf3',
+               filter:(it)=>!it.text.startsWith('_')}}},
+      scales:{x:{ticks:{color:'#93a0ad', maxTicksLimit:10}, grid:{display:false}},
+              y:Object.assign({ticks:{color:'#93a0ad'}, grid:{color:'#2a3340'}},
+                              yextra || {})}}});
+  finish(id);
+}
+function stopTimer(id){ if(timers[id]){ clearInterval(timers[id]); timers[id] = null; } }
+function finish(id){ stopTimer(id);
+  const c = charts[id], f = fulls[id];
+  c.data.labels = f.labels.slice();
+  c.data.datasets.forEach((d,i)=> d.data = f.data[i].slice());
+  c.update('none');
+}
+function play(id){ stopTimer(id);
+  const c = charts[id], f = fulls[id];
+  c.data.labels = []; c.data.datasets.forEach(d => d.data = []); c.update('none');
+  let t = 0; const total = f.labels.length;
+  const step = Math.max(8, Math.min(80, 9000/total));
+  timers[id] = setInterval(() => {
+    if(t >= total){ stopTimer(id); return; }
+    c.data.labels.push(f.labels[t]);
+    c.data.datasets.forEach((d,i)=> d.data.push(f.data[i][t]));
+    c.update('none'); t++;
+  }, step);
+}
+function series(dict){
+  return Object.keys(dict).map((t,i)=>({label:t, data:dict[t],
+    borderColor:PALETTE[i % PALETTE.length], borderWidth:2.2, pointRadius:0}));
+}
+function buildForecast(){
+  const t = document.getElementById('fticker').value;
+  if(!t || !DATA.forecast[t]) return;
+  const f = DATA.forecast[t], nt = f.n_train, nT = f.actual.length;
+  const pad = arr => Array(nt).fill(null).concat(arr);
+  mk('forecast', f.labels, [
+    {label:'train (actual)', data: f.train.concat(Array(nT).fill(null)),
+     borderColor:'#e8edf3', borderWidth:1.4, pointRadius:0},
+    {label:'reality', data: pad(f.actual), borderColor:'#93a0ad', borderWidth:2, pointRadius:0},
+    {label:'ARIMA(1,1,1) forecast', data: pad(f.mean), borderColor:'#7ba3d6',
+     borderWidth:2.6, pointRadius:0},
+    {label:'95% CI', data: pad(f.hi), borderColor:'rgba(0,0,0,0)',
+     backgroundColor:'rgba(123,163,214,.16)', pointRadius:0, fill:'+1'},
+    {label:'_lo', data: pad(f.lo), borderColor:'rgba(0,0,0,0)', pointRadius:0},
+  ]);
+}
+async function load(){
+  DATA = await fetch('data').then(r=>r.json());
+  document.getElementById('tickers').value = DATA.tickers;
+  document.getElementById('cutoff').value = DATA.cutoff;
+  if(!KEY){ document.getElementById('apply').disabled = true;
+            document.getElementById('cmsg').textContent = 'view-only (no key)'; }
+  mk('growth', DATA.dates, series(DATA.growth), {type:'logarithmic'});
+  mk('daycum', DATA.dates, series(DATA.daycum),
+     {title:{display:true, text:'profit ($1/day)', color:'#93a0ad'}});
+  mk('arena', DATA.dates, series(DATA.arena),
+     {title:{display:true, text:'profit ($1/day)', color:'#93a0ad'}});
+  const sel = document.getElementById('fticker');
+  sel.innerHTML = Object.keys(DATA.forecast)
+      .map(t => "<option>" + t + "</option>").join('');
+  buildForecast();
+}
+async function applySettings(){
+  document.getElementById('cmsg').textContent = 'rebuilding — downloads fresh data, ~30 s…';
+  const res = await fetch('settings', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({key: KEY,
+      tickers: document.getElementById('tickers').value,
+      cutoff: document.getElementById('cutoff').value})});
+  const j = await res.json().catch(()=>({}));
+  document.getElementById('cmsg').textContent = res.ok ? '' : (j.error || 'error');
+  if(res.ok) load();
+}
+load();
+"""
+
+
+def launch_dashboard(tickers="^GSPC, BTC-USD, GME", start="2019-01-01",
+                     cutoff="2025-06-01", teacher_key=None, port=8772, tunnel=True):
+    """Host the animated lecture dashboard. Returns (viewer_url, control_url)."""
+    teacher_key = teacher_key or secrets.token_hex(4)
+    payload = {"data": _dashboard_compute(tickers, start, cutoff)}
+    lock = threading.Lock()
+    app = Flask("dashboard")
+
+    @app.get("/")
+    def page():
+        return Response(_page("Lecture Dashboard", _DARK_CSS, _DASH_HTML, _DASH_JS),
+                        mimetype="text/html")
+
+    @app.get("/data")
+    def data():
+        with lock:
+            return jsonify(payload["data"])
+
+    @app.post("/settings")
+    def settings():
+        body = request.get_json(force=True)
+        if body.get("key") != teacher_key:
+            return jsonify({"error": "wrong key"}), 403
+        try:
+            fresh = _dashboard_compute(body.get("tickers") or tickers,
+                                       body.get("start") or start,
+                                       body.get("cutoff") or cutoff)
+        except Exception as e:                               # noqa: BLE001
+            return jsonify({"error": str(e)}), 400
+        with lock:
+            payload["data"] = fresh
+        return jsonify({"ok": True})
+
+    base = _serve("dashboard", app, port, tunnel)
+    viewer_url = f"{base}/"
+    control_url = f"{base}/?key={teacher_key}"
+    _announce("📊 Lecture Dashboard", viewer_url, control_url)
+    return viewer_url, control_url

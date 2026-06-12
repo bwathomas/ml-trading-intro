@@ -33,10 +33,15 @@ students join from their phones (via a free Cloudflare quick-tunnel — no accou
 
 - **Wisdom of the Crowd 🔮** — students submit numeric guesses one question at a time;
   the teacher reveals the true answer, the crowd average, and the full histogram.
-- **The Strategy Arena 🏆** — students paste the `Strategy` subclass they built in
-  Part 6 of the lab; the teacher runs a market replay and every strategy's profit line
-  races across the projector, ending in a top-3 podium with ROI. Everyone else sees
-  their placement privately on their own device.
+- **The Strategy Arena 🏆** — students describe a strategy in plain English; an LLM
+  (the teacher's OpenAI key) turns it into code and test-drives it on a practice
+  window so each student sees a private graph of their idea. They submit (and
+  resubmit) their best version; the teacher then runs a market replay on unseen dates
+  and every strategy's profit line races across the projector, ending in a top-3
+  podium with ROI. Everyone else sees their placement privately on their own device.
+- **The Lecture Dashboard 📊** — animated play-button versions of the lab's key charts
+  (buy & hold, $1/day, FTL vs. oracle, ARIMA forecast cone) with a control box for
+  tickers and the forecast cutoff, for use mid-lecture.
 
 The notebook cells only hold the knobs (stock universe, replay dates, fees, timeouts);
 all server code lives in [`classroom.py`](classroom.py). **The repo must be public**
