@@ -19,6 +19,7 @@ throwaway Colab VM; do not host it anywhere you care about.
 import concurrent.futures
 import io
 import json
+import logging
 import multiprocessing
 import os
 import re
@@ -57,6 +58,7 @@ def _free_port(preferred):
 
 def _start_server(name, app, port):
     """(Re)start a named Flask server on a background thread."""
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)   # silence request spam
     if name in _SERVERS:
         try:
             _SERVERS[name][0].shutdown()
