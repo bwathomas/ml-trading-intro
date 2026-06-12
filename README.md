@@ -10,9 +10,11 @@ GameStop vs. the S&P 500 vs. Bitcoin (plus any tickers you want to add).
 | Part | Topic | Lecture tie-in |
 |---|---|---|
 | 1 | Data exploration with `yfinance`; buy-&-hold vs. $1/day measurement; start-date sensitivity | implicit p-hacking |
-| 2 | Online learning on the full S&P 500: random picks, a forward-looking oracle, Follow-The-Leader, Hedge (multiplicative weights); the effect of fees | regularized FTL, regret, fees & slippage |
+| 2 | Online learning on the full S&P 500: random picks, a forward-looking oracle, Follow-The-Leader (all-in and weighted-by-yesterday), historic confidence scores (Hedge / multiplicative weights); the effect of fees | regularized FTL, regret |
 | 3 | Classical forecasting: AR, MA, ARIMA configs, quarterly S-ARIMA, all evaluated past a train/test cutoff | backtesting honestly |
 | 4 | RNN and GRU forecasters vs. an "embarrassingly simple" linear model (Zeng et al., 2022); sign-trading backtest with Sharpe ratios | alpha vs. beta, transformers aren't all you need |
+| 5 | Regime change: lock in all three model families before 2008 and trade through the crisis; bootstrap "same-regime" futures vs. what actually happened; fees and slippage | regime changes, convexity, fees & slippage |
+| 6 | "Vibe-code your own strategy": a `Strategy` class + day-by-day backtester that only ever shows the past, an LLM prompt template, and a class competition scored by Sharpe | the whole lecture |
 
 Every strategy is scored the same way: **invest $1 every day, sell at the close**, and
 report cumulative profit plus the annualized **Sharpe ratio**.
