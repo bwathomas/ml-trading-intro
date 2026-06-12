@@ -26,6 +26,23 @@ few minutes on Colab's free tier (a T4 GPU helps Part 4 but isn't required — a
 are deliberately tiny). The only network dependencies are Yahoo Finance (prices) and
 Wikipedia (the S&P 500 member list).
 
+## Live class activities (teacher-hosted)
+
+`host_activities.ipynb` turns the teacher's own Colab runtime into a small web server
+students join from their phones (via a free Cloudflare quick-tunnel — no accounts):
+
+- **Wisdom of the Crowd 🔮** — students submit numeric guesses one question at a time;
+  the teacher reveals the true answer, the crowd average, and the full histogram.
+- **The Strategy Arena 🏆** — students paste the `Strategy` subclass they built in
+  Part 6 of the lab; the teacher runs a market replay and every strategy's profit line
+  races across the projector, ending in a top-3 podium with ROI. Everyone else sees
+  their placement privately on their own device.
+
+The notebook cells only hold the knobs (stock universe, replay dates, fees, timeouts);
+all server code lives in [`classroom.py`](classroom.py). **The repo must be public**
+for the host notebook's setup cell to clone it. Note: the Arena executes
+student-submitted code in subprocesses on the teacher's runtime — use a throwaway VM.
+
 ## For students
 
 - Add your own tickers in the first cell of Part 1 — everything downstream adapts.
